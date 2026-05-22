@@ -38,6 +38,13 @@ try:
 except ImportError:
     ECG_PLOT_OK = False
 
+try:
+    import neurokit2 as nk
+    import pandas as pd
+    NK_OK = True
+except ImportError:
+    NK_OK = False
+
 from filters import (
     filtro_chebyshev2_hp,
     filtro_butterworth_bp,
@@ -130,8 +137,8 @@ st.set_page_config(
 st.title("🫀 Visualizador ECG MIMIC")
 st.caption(
     "Carga registros MIMIC (.hea + .dat) · Filtros digitales · "
-    "Baseline removal · Vista clínica estándar (ecg-plot) · "
-    "Super Resolución ECG con CECGSR"
+    "Baseline removal · Vista clínica (ecg-plot) · "
+    "Super Resolución CECGSR · Análisis HRV con NeuroKit2"
 )
 
 
@@ -354,6 +361,19 @@ with st.sidebar:
     ecg_columnas = st.slider("Columnas (multi-derivación)", 1, 4, 2) if ecg_modo == "Multi-derivación" else 2
     ecg_dpi      = st.slider("DPI exportación PNG", 72, 300, 150, step=50)
     ecg_usar_corregida = st.checkbox("Usar señal con baseline removed", value=True)
+
+    st.divider()
+
+    st.subheader("🧠 NeuroKit2")
+    if not NK_OK:
+        st.warning("neurokit2 no instalado. Añade `neurokit2` a requirements.txt.")
+    nk_metodo = st.selectbox(
+        "Detector de picos R",
+        ["neurokit", "pantompkins1985", "hamilton2002", "elgendi2010", "engzeemod2012"],
+        key="nk_metodo_sb",
+    )
+    nk_dur_sb       = st.slider("Duración análisis (s)", 5, 30, 15, key="nk_dur_sb")
+    nk_usar_filtrada = st.checkbox("Usar señal con baseline removed", value=True, key="nk_filtrada_sb")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -677,13 +697,14 @@ if signals_dict:
     señales_filtradas = aplicar_filtros(sig_para_filtrar, fs, filtros_sel, wavelet_on)
 
     # TABS
-    tab_plotly, tab_comp, tab_clinica, tab_stats, tab_export, tab_sr = st.tabs([
+    tab_plotly, tab_comp, tab_clinica, tab_stats, tab_export, tab_sr, tab_nk = st.tabs([
         "📈 Análisis de filtros",
         "🔀 Comparativa",
         "🩺 Vista clínica",
         "📊 Estadísticas",
         "💾 Exportar",
         "🔬 Super Resolución ECG",
+        "🧠 NeuroKit2",
     ])
 
     # Tab 1
@@ -1428,6 +1449,246 @@ if signals_dict:
                 f"{len(json_str)/1e3:.1f} KB"
             )
 
+    # ── Tab 7: NeuroKit2 ──────────────────────────────────────────────────
+    with tab_nk:
+        if not NK_OK:
+            st.error(
+                "neurokit2 no está instalado. "
+                "Añade `neurokit2>=0.2.7` a requirements.txt y redespliega."
+            )
+            st.stop()
+
+        st.markdown("### 🧠 Análisis ECG con NeuroKit2")
+        st.caption(
+            "Detección automática de picos R · Segmentación de ondas P/Q/R/S/T · "
+            "Intervalos RR · Métricas de variabilidad de la frecuencia cardiaca (HRV)"
+        )
+
+        # ── Controles locales ──────────────────────────────────────────────
+        nk_col1, nk_col2 = st.columns(2)
+        with nk_col1:
+            nk_lead = st.selectbox("Derivación", leads_disponibles, key="nk_lead_tab")
+        with nk_col2:
+            nk_dur = st.slider(
+                "Duración (s)", 5, min(60, duracion), min(nk_dur_sb, duracion), key="nk_dur_tab"
+            )
+
+        # ── Señal de entrada ──────────────────────────────────────────────
+        sig_nk_base = signals_dict[nk_lead]
+        if nk_usar_filtrada and baseline_sel != "Ninguno":
+            sig_nk_base, _ = aplicar_baseline(sig_nk_base, fs, baseline_sel, poly_order, spline_knots)
+
+        n_nk   = min(int(nk_dur * fs), len(sig_nk_base))
+        sig_nk = sig_nk_base[:n_nk].copy()
+        t_nk   = np.arange(n_nk) / fs
+
+        # ── Procesamiento ─────────────────────────────────────────────────
+        with st.spinner("Procesando señal con NeuroKit2…"):
+            try:
+                sig_nk_clean = nk.ecg_clean(sig_nk, sampling_rate=int(fs), method="neurokit")
+
+                _, rpeaks_info = nk.ecg_peaks(
+                    sig_nk_clean, sampling_rate=int(fs), method=nk_metodo
+                )
+                rpeaks = rpeaks_info["ECG_R_Peaks"]
+
+                try:
+                    _, waves_info = nk.ecg_delineate(
+                        sig_nk_clean, rpeaks_info,
+                        sampling_rate=int(fs), method="dwt",
+                    )
+                    waves_ok = True
+                except Exception:
+                    waves_ok = False
+
+                hrv_ok   = False
+                hrv_time = {}
+                if len(rpeaks) >= 4:
+                    try:
+                        hrv_df   = nk.hrv_time(rpeaks_info, sampling_rate=int(fs), show=False)
+                        hrv_time = hrv_df.to_dict(orient="records")[0]
+                        hrv_ok   = True
+                    except Exception:
+                        pass
+
+                nk_error = None
+            except Exception as e:
+                nk_error = str(e)
+
+        if nk_error:
+            st.error(f"Error en NeuroKit2: {nk_error}")
+            st.stop()
+
+        # ── Métricas clave ────────────────────────────────────────────────
+        rr_intervals = np.diff(rpeaks) / fs * 1000  # ms
+        fc_bpm = len(rpeaks) / nk_dur * 60 if nk_dur > 0 else 0
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Picos R detectados", f"{len(rpeaks)}")
+        m2.metric("FC estimada (bpm)",  f"{fc_bpm:.1f}")
+        m3.metric("RR medio (ms)",      f"{rr_intervals.mean():.1f}" if len(rr_intervals) else "—")
+        m4.metric("RR std (ms)",        f"{rr_intervals.std():.1f}"  if len(rr_intervals) else "—")
+        m5.metric("Método detector",    nk_metodo)
+
+        st.divider()
+
+        # ── Gráfica principal: ECG + picos R + ondas ──────────────────────
+        fig_nk = go.Figure()
+
+        fig_nk.add_trace(go.Scatter(
+            x=t_nk, y=sig_nk_clean,
+            mode="lines", name="ECG limpio",
+            line=dict(color="#378ADD", width=1.2),
+        ))
+        fig_nk.add_trace(go.Scatter(
+            x=t_nk[rpeaks], y=sig_nk_clean[rpeaks],
+            mode="markers", name="Picos R",
+            marker=dict(color="#E63946", size=8, symbol="triangle-up"),
+        ))
+
+        if waves_ok:
+            wave_cfg = {
+                "ECG_P_Peaks": ("Onda P", "#2ECC71", "circle",       6),
+                "ECG_Q_Peaks": ("Onda Q", "#F39C12", "triangle-down",6),
+                "ECG_S_Peaks": ("Onda S", "#9B59B6", "triangle-down",6),
+                "ECG_T_Peaks": ("Onda T", "#1ABC9C", "diamond",      7),
+            }
+            for key, (label, color, symbol, sz) in wave_cfg.items():
+                if key in waves_info:
+                    idxs = np.array(waves_info[key])
+                    idxs = idxs[~np.isnan(idxs)].astype(int)
+                    idxs = idxs[(idxs >= 0) & (idxs < len(sig_nk_clean))]
+                    if len(idxs):
+                        fig_nk.add_trace(go.Scatter(
+                            x=t_nk[idxs], y=sig_nk_clean[idxs],
+                            mode="markers", name=label,
+                            marker=dict(color=color, size=sz, symbol=symbol),
+                        ))
+
+        fig_nk.update_layout(
+            height=360,
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            title=dict(text=f"ECG procesado · {nk_lead} · detector: {nk_metodo}", font=dict(size=13)),
+            xaxis=dict(title="Tiempo (s)", gridcolor="#f0f0f0"),
+            yaxis=dict(title="Amplitud (mV)", gridcolor="#f0f0f0"),
+            legend=dict(orientation="h", y=1.08, font=dict(size=11)),
+            margin=dict(l=50, r=20, t=60, b=40),
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_nk, use_container_width=True, key="nk_fig_main")
+
+        # ── Tacograma (intervalos RR) ─────────────────────────────────────
+        if len(rr_intervals) >= 3:
+            with st.expander("📊 Tacograma — intervalos RR", expanded=True):
+                fig_rr = go.Figure()
+                fig_rr.add_trace(go.Scatter(
+                    x=np.arange(1, len(rr_intervals) + 1),
+                    y=rr_intervals,
+                    mode="lines+markers",
+                    line=dict(color="#378ADD", width=1.5),
+                    marker=dict(size=5),
+                    name="RR (ms)",
+                ))
+                fig_rr.add_hline(
+                    y=rr_intervals.mean(), line_dash="dash",
+                    line_color="#E63946",
+                    annotation_text=f"Media: {rr_intervals.mean():.1f} ms",
+                )
+                fig_rr.update_layout(
+                    height=230,
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    xaxis=dict(title="Latido #", gridcolor="#f0f0f0"),
+                    yaxis=dict(title="RR (ms)",  gridcolor="#f0f0f0"),
+                    showlegend=False,
+                    margin=dict(l=50, r=20, t=20, b=40),
+                )
+                st.plotly_chart(fig_rr, use_container_width=True, key="nk_fig_rr")
+
+        # ── HRV dominio temporal ──────────────────────────────────────────
+        if hrv_ok and hrv_time:
+            st.divider()
+            st.markdown("#### 💓 Métricas HRV (dominio temporal)")
+
+            hrv_campos = {
+                "HRV_MeanNN": ("RR medio (ms)",  "ms", "Duración media de intervalos RR"),
+                "HRV_SDNN":   ("SDNN (ms)",       "ms", "Desviación estándar de NN — variabilidad global"),
+                "HRV_RMSSD":  ("RMSSD (ms)",      "ms", "Raíz cuadrática de diferencias sucesivas — tono vagal"),
+                "HRV_pNN50":  ("pNN50 (%)",        "%",  "% intervalos NN con diferencia >50 ms"),
+                "HRV_SDSD":   ("SDSD (ms)",        "ms", "Std de diferencias sucesivas NN"),
+                "HRV_MadNN":  ("MadNN (ms)",       "ms", "Desviación absoluta mediana de NN"),
+            }
+
+            hrv_cols = st.columns(3)
+            for i, (k, (label, unit, tip)) in enumerate(hrv_campos.items()):
+                if k in hrv_time and hrv_time[k] is not None:
+                    try:
+                        hrv_cols[i % 3].metric(label, f"{float(hrv_time[k]):.2f} {unit}", help=tip)
+                    except Exception:
+                        pass
+
+            with st.expander("📋 Tabla HRV completa", expanded=False):
+                df_hrv = pd.DataFrame([
+                    {"Métrica": k, "Valor": round(float(v), 4)}
+                    for k, v in hrv_time.items()
+                    if v is not None
+                ])
+                st.dataframe(df_hrv, use_container_width=True, hide_index=True)
+
+        # ── Latido promedio (template) ────────────────────────────────────
+        if len(rpeaks) >= 5:
+            with st.expander("💗 Latido promedio (template)", expanded=False):
+                try:
+                    pre_ms, post_ms = 300, 500
+                    pre  = int(pre_ms  / 1000 * fs)
+                    post = int(post_ms / 1000 * fs)
+                    beats = [
+                        sig_nk_clean[r - pre: r + post]
+                        for r in rpeaks
+                        if r - pre >= 0 and r + post < len(sig_nk_clean)
+                    ]
+                    if beats:
+                        t_beat   = np.linspace(-pre_ms, post_ms, pre + post) / 1000
+                        beat_arr = np.array(beats)
+                        mean_b   = beat_arr.mean(axis=0)
+                        std_b    = beat_arr.std(axis=0)
+
+                        fig_beat = go.Figure()
+                        fig_beat.add_trace(go.Scatter(
+                            x=np.concatenate([t_beat, t_beat[::-1]]),
+                            y=np.concatenate([mean_b + std_b, (mean_b - std_b)[::-1]]),
+                            fill="toself",
+                            fillcolor="rgba(55,138,221,0.15)",
+                            line=dict(color="rgba(255,255,255,0)"),
+                            showlegend=False,
+                            name="±1 SD",
+                        ))
+                        fig_beat.add_trace(go.Scatter(
+                            x=t_beat, y=mean_b,
+                            mode="lines",
+                            name=f"Media ({len(beats)} latidos)",
+                            line=dict(color="#378ADD", width=2),
+                        ))
+                        fig_beat.add_vline(
+                            x=0, line_dash="dash", line_color="#E63946",
+                            annotation_text="R",
+                        )
+                        fig_beat.update_layout(
+                            height=260,
+                            plot_bgcolor="white", paper_bgcolor="white",
+                            xaxis=dict(title="Tiempo rel. al pico R (s)", gridcolor="#f0f0f0"),
+                            yaxis=dict(title="Amplitud (mV)", gridcolor="#f0f0f0"),
+                            margin=dict(l=50, r=20, t=20, b=40),
+                            showlegend=True,
+                        )
+                        st.plotly_chart(fig_beat, use_container_width=True, key="nk_fig_beat")
+                        st.caption(
+                            f"Banda sombreada = ±1 desviación estándar · "
+                            f"basado en {len(beats)} latidos."
+                        )
+                except Exception as e:
+                    st.warning(f"No se pudo calcular el latido promedio: {e}")
+
 # Estado vacío
 else:
     st.info(
@@ -1467,6 +1728,7 @@ Pestaña	Qué muestra
 📊 Estadísticas	RMS, amplitud, reducción de baseline por filtro
 💾 Exportar	JSON compatible con el visualizador web original
 🔬 Super Resolución ECG	Mejora la señal usando modelo CECGSR (real) o métodos clásicos
+🧠 NeuroKit2	Detección R, ondas P/Q/S/T, tacograma, HRV y latido promedio
 Carga de carpeta:
 
 Selecciona múltiples archivos .hea + .dat a la vez
