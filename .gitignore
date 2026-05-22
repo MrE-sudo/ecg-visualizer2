@@ -1,0 +1,35 @@
+# entorno virtual
+.venv/
+venv/
+env/
+
+# python
+__pycache__/
+*.pyc
+
+# datos ECG (MUY IMPORTANTE)
+data_dir/
+*.dat
+*.hea
+
+# tus carpetas
+tests/
+scripts/
+
+# distribución / build
+build/
+dist/
+*.egg-info/
+
+# notebooks
+.ipynb_checkpoints
+
+# variables de entorno
+.env
+
+# cache / testing
+.pytest_cache/
+.coverage
+
+# sistema
+.DS_Store
