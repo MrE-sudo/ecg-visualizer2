@@ -12,3 +12,4 @@ plotly>=5.18.0
 PyWavelets>=1.5.0
 ecg-plot>=0.2.8        # ← añadir esta línea
 matplotlib>=3.7.0      # ← y esta (ecg-plot la necesita)
+torch
